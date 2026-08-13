@@ -6,7 +6,7 @@
 #   bash run_corpus.sh
 #
 # Knobs:
-#   M3_SECONDS  clip length per track            (default 30)
+#   M3_SECONDS  clip length per track            (default 120)
 #   M3_LIMIT    templates per round, 0 = all     (default 0)
 #   M3_ROUNDS   rounds with different seeds      (default 1)
 #   M3_SEED     base seed                        (default 0)
@@ -21,7 +21,7 @@ export PATH="$HOME/.local/bin:$PATH"
 TPL_DIR="$REPO_DIR/cache/m3-github/skills/music-caption-rewriter/templates"
 OUT_DIR="$REPO_DIR/cache/codes_templates"
 
-M3_SECONDS="${M3_SECONDS:-30}"
+M3_SECONDS="${M3_SECONDS:-120}"
 M3_LIMIT="${M3_LIMIT:-0}"
 M3_ROUNDS="${M3_ROUNDS:-1}"
 M3_SEED="${M3_SEED:-0}"

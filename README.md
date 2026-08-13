@@ -46,7 +46,7 @@ uv run music3-generate-codes ~/music/ace/audio/wav_neon --seconds 10 --limit 3
 #       https://github.com/MiniMax-AI/MiniMax-Music3 m3-github && \
 #       cd m3-github && git sparse-checkout set skills/music-caption-rewriter/templates
 uv run music3-generate-codes --templates cache/m3-github/skills/music-caption-rewriter/templates \
-    --shuffle --limit 50 --seconds 30 --out cache/codes_templates
+    --shuffle --limit 50 --seconds 120 --out cache/codes_templates
 
 # 3. QLoRA smoke on those caches
 uv run music3-train --data cache/codes --steps 50 --max-frames 250

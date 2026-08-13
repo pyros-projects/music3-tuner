@@ -50,7 +50,7 @@ def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) 
 
     cache = DynamicCache()
     frames: list[torch.Tensor] = []
-    for _ in tqdm(range(max_frames + 1), desc="AR sampling"):
+    for _ in tqdm(range(max_frames), desc="AR sampling"):
         output = model.lm.get_decoder()(inputs_embeds=embeds, past_key_values=cache, use_cache=True)
         cache = output.past_key_values
         hidden = output.last_hidden_state[:, -1]
