@@ -37,6 +37,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None, help="default: out/gen/<prompt-slug>-s<seed>.wav")
     parser.add_argument("--steps", type=int, default=FM_STEPS, help="flow-matching steps per chunk")
     parser.add_argument("--cfg", type=float, default=FM_CFG_SCALE, help="flow-matching guidance scale")
+    parser.add_argument("--lora", type=Path, default=None, help="peft adapter dir (e.g. out/lora_cyanism/step-400)")
+    parser.add_argument("--lora-scale", type=float, default=1.0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--no-quant", action="store_true", help="bf16 8B instead of NF4 (needs ~30GB VRAM)")
     args = parser.parse_args()
@@ -48,6 +50,16 @@ def main() -> None:
     started = time.time()
     tokenizer = load_tokenizer()
     model = load_music3_ar(quantize=not args.no_quant, device=args.device, with_depth=True)
+    if args.lora:
+        from peft import PeftModel
+
+        model.lm = PeftModel.from_pretrained(model.lm, str(args.lora))
+        if args.lora_scale != 1.0:
+            for module in model.lm.modules():
+                if hasattr(module, "scaling") and isinstance(module.scaling, dict):
+                    module.scaling = {k: v * args.lora_scale for k, v in module.scaling.items()}
+        model.lm.eval()
+        console.print(f"[dim]LoRA loaded: {args.lora} (scale {args.lora_scale})[/dim]")
     components = load_synthesis_components(device=args.device)
 
     prompt_ids = encode_prompt(tokenizer, args.prompt, args.lyrics)
