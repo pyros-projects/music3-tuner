@@ -220,12 +220,12 @@ class Music3AR(nn.Module):
             hidden[keep], self.lm.get_output_embeddings(), shifted[keep]
         )
 
-    def depth_loss(self, hidden: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
-        """Teacher-forced CE for the depth decoder (codebooks 1..7).
+    def _depth_forward(self, hidden: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced depth-decoder pass for N frames.
 
-        hidden [N, H] global-LM hiddens at frame positions, codes [N, 8].
-        Sequence per frame: [proj(h), proj(embed_c0), proj(extra(c1..c6))];
-        causal position j (1..7) predicts codebook j via head j-1.
+        hidden [N, H] global-LM hiddens, codes [N, 8]. Sequence per frame:
+        [proj(h), proj(embed_c0), proj(extra(c1..c6))]; returns decoder
+        outputs [N, 8, H] — causal position j (1..7) predicts codebook j.
         """
         cfg = self.cfg
         assert self.depth_decoder is not None, "depth decoder not loaded"
@@ -236,9 +236,19 @@ class Music3AR(nn.Module):
         sequence = torch.cat(
             [hidden.unsqueeze(1), c0_embed.unsqueeze(1), extra.to(hidden.dtype)], dim=1
         )
-        out = decoder(decoder.projection(sequence))
+        return decoder(decoder.projection(sequence))
+
+    def depth_hiddens(self, hidden: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        """Per-frame depth hiddens [N, 7, H] (positions 1..7) — the residual
+        slices of the synthesis conditioning."""
+        return self._depth_forward(hidden, codes)[:, 1:]
+
+    def depth_loss(self, hidden: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced CE for the depth decoder (codebooks 1..7)."""
+        cfg = self.cfg
+        out = self._depth_forward(hidden, codes)
         losses = []
         for book in range(1, cfg.num_codebooks):
-            logits = decoder.audio_heads[book - 1](out[:, book]).float()
+            logits = self.depth_decoder.audio_heads[book - 1](out[:, book]).float()
             losses.append(F.cross_entropy(logits, codes[:, book]))
         return torch.stack(losses).mean()

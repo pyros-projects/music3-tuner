@@ -27,7 +27,8 @@ already in place and testable with model-generated codes.
 | `dataset.py` | cached code sequences + ace-style caption sidecar parser |
 | `cache_audio.py` | wav dir → DAV latents (+ `--roundtrip` SNR verification) |
 | `generate_codes.py` | AR sampling (CFG 1.5 / top-k 50) → dataset-format code caches |
-| `train.py` | QLoRA (NF4 + peft) on the 8B, 23 GiB VRAM watchdog, caption dropout |
+| `synth.py` | codes → audio: teacher-forced hiddens + chunked FM (CFG 1.7, 30 steps) + vocoder |
+| `train.py` | QLoRA (NF4 + peft) on the 8B, VRAM watchdog, caption dropout |
 
 ## Usage
 
@@ -47,6 +48,9 @@ uv run music3-generate-codes ~/music/ace/audio/wav_neon --seconds 10 --limit 3
 #       cd m3-github && git sparse-checkout set skills/music-caption-rewriter/templates
 uv run music3-generate-codes --templates cache/m3-github/skills/music-caption-rewriter/templates \
     --shuffle --limit 50 --seconds 120 --out cache/codes_templates
+
+# 2c. codes → audio (needs transformer/vocoder/scheduler subfolders, FULL=1 on pods)
+uv run music3-synth cache/codes_templates --limit 5 --out cache/wavs
 
 # 3. QLoRA smoke on those caches
 uv run music3-train --data cache/codes --steps 50 --max-frames 250
