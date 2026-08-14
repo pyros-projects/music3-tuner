@@ -32,6 +32,7 @@ class CodesEncoder(nn.Module):
         c0_vocab: int = 16384,
         audio_vocab: int = 1024,
         num_codebooks: int = 8,
+        dropout: float = 0.2,
     ):
         super().__init__()
         self.config = {
@@ -43,16 +44,24 @@ class CodesEncoder(nn.Module):
             "c0_vocab": c0_vocab,
             "audio_vocab": audio_vocab,
             "num_codebooks": num_codebooks,
+            "dropout": dropout,
         }
         self.stem = nn.Sequential(
             nn.Conv1d(latent_dim, d_model, kernel_size=5, padding=2),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Conv1d(d_model, d_model, kernel_size=5, stride=2, padding=2),
             nn.GELU(),
             nn.Conv1d(d_model, d_model, kernel_size=5, stride=2, padding=2),
         )
         layer = nn.TransformerEncoderLayer(
-            d_model, num_heads, ff_dim, batch_first=True, norm_first=True, activation="gelu"
+            d_model,
+            num_heads,
+            ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers)
         self.norm = nn.LayerNorm(d_model)

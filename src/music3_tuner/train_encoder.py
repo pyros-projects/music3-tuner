@@ -74,8 +74,21 @@ class PairsDataset(Dataset):
         features = latent_to_features(latent, frames)  # [128, 4*T]
         crop = min(self.crop, frames)
         start = self.rng.randrange(frames - crop + 1) if (self.train and frames > crop) else 0
+        features = features[:, start * FEATURE_RATE : (start + crop) * FEATURE_RATE]
+        if self.augment:
+            # SpecAugment-style masking — the anti-memorization lever: force
+            # the model to infer codes from context instead of lookup.
+            features = features.clone()
+            for _ in range(2):  # time masks (up to ~1.6s each)
+                width = self.rng.randrange(1, 40) * FEATURE_RATE
+                begin = self.rng.randrange(max(1, features.shape[1] - width))
+                features[:, begin : begin + width] = 0.0
+            for _ in range(2):  # latent-channel masks
+                width = self.rng.randrange(1, 16)
+                begin = self.rng.randrange(max(1, features.shape[0] - width))
+                features[begin : begin + width] = 0.0
         return {
-            "features": features[:, start * FEATURE_RATE : (start + crop) * FEATURE_RATE],
+            "features": features,
             "codes": codes[start : start + crop],
         }
 
@@ -151,11 +164,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pairs", type=Path, default=Path("cache/pairs"))
     parser.add_argument("--out", type=Path, default=Path("out/encoder"))
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--steps", type=int, default=4000, help="schedule sized to the ~1000-pair corpus: val peaks ~2k, cosine decays into it")
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--crop", type=int, default=512, help="crop length in code frames (512 ≈ 20.5s)")
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--warmup", type=int, default=500)
+    parser.add_argument("--warmup", type=int, default=250)
     parser.add_argument("--val-frac", type=float, default=0.05)
     parser.add_argument("--val-every", type=int, default=500)
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -194,7 +207,7 @@ def main() -> None:
     model = CodesEncoder(d_model=args.d_model, num_layers=args.layers).to(args.device)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     ema = Ema(model, args.ema_decay)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
 
     def lr_lambda(step: int) -> float:
         if step < args.warmup:
