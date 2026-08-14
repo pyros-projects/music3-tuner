@@ -107,21 +107,27 @@ def load_encoder(out_dir: Path, device: str = "cpu") -> CodesEncoder:
 
 @torch.no_grad()
 def encode_wav_to_codes(
-    wav_path: Path, encoder: CodesEncoder, dav, device: str
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 256
 ) -> torch.Tensor:
-    """wav → DAV latent → predicted codes [T, 8] (argmax)."""
+    """wav → DAV latent → predicted codes [T, 8] (argmax).
+
+    Runs in `window`-frame slices (the training crop length) — sinusoidal
+    positions and attention patterns don't extrapolate to full songs."""
     from .cache_audio import load_wav_44k_stereo
     from .dav import SAMPLE_RATE
 
     waveform = load_wav_44k_stereo(wav_path).to(device)
     latent = dav.encode(waveform).squeeze(0)
     num_frames = int(round(waveform.shape[-1] / SAMPLE_RATE * AUDIO_FRAMES_PER_SECOND))
-    features = latent_to_features(latent, num_frames).unsqueeze(0).to(device)
-    c0_logits, acoustic_logits = encoder(features)
-    codes = torch.cat(
-        [c0_logits.argmax(-1).unsqueeze(-1), acoustic_logits.argmax(-1)], dim=-1
-    )
-    return codes.squeeze(0)  # [T, 8]
+    features = latent_to_features(latent, num_frames).to(device)
+    pieces = []
+    for start in range(0, num_frames, window):
+        chunk = features[:, start * FEATURE_RATE : (start + window) * FEATURE_RATE].unsqueeze(0)
+        c0_logits, acoustic_logits = encoder(chunk)
+        pieces.append(
+            torch.cat([c0_logits.argmax(-1).unsqueeze(-1), acoustic_logits.argmax(-1)], dim=-1)
+        )
+    return torch.cat(pieces, dim=1).squeeze(0)  # [T, 8]
 
 
 def main() -> None:
