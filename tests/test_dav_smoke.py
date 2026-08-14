@@ -34,3 +34,9 @@ def test_dav_loads_and_roundtrips():
     # A correct port reconstructs audibly; a broken key-mapping yields noise
     # (negative SNR). The bar is deliberately conservative.
     assert score > 0.0, f"roundtrip SNR {score:.2f} dB — encoder/decoder mismatch?"
+
+    # chunked encode must match whole-input encode away from chunk edges
+    chunked = dav.encode(waveform, chunk_samples=512 * 128, overlap_samples=512 * 16)
+    assert chunked.shape == latent.shape
+    delta = (chunked - latent).abs().max().item()
+    assert delta < 5e-2, f"chunked encode diverges from whole encode (max delta {delta})"

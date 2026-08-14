@@ -166,8 +166,7 @@ class MusicDav(nn.Module):
         self.decoder = Decoder()
 
     @torch.no_grad()
-    def encode(self, waveform: torch.Tensor, sample_posterior: bool = False) -> torch.Tensor:
-        """[B, 2, samples] @ 44.1 kHz → latent [B, 128, T] (stereo folded)."""
+    def _encode_whole(self, waveform: torch.Tensor, sample_posterior: bool) -> torch.Tensor:
         batch, channels, samples = waveform.shape
         assert channels == 2, "MusicDav expects stereo input; duplicate mono first"
         folded = waveform.reshape(batch * 2, 1, samples)
@@ -177,6 +176,33 @@ class MusicDav(nn.Module):
             logs = self.logs_proj(hidden)
             mean = mean + torch.randn_like(mean) * torch.exp(logs)
         return mean.reshape(batch, 2 * LATENT_DIM_PER_CHANNEL, -1)
+
+    @torch.no_grad()
+    def encode(
+        self,
+        waveform: torch.Tensor,
+        sample_posterior: bool = False,
+        chunk_samples: int = HOP * 2560,  # ~29.7 s — full-resolution conv activations blow up VRAM on long tracks
+        overlap_samples: int = HOP * 16,
+    ) -> torch.Tensor:
+        """[B, 2, samples] @ 44.1 kHz → latent [B, 128, T] (stereo folded).
+
+        Long inputs are encoded in overlapping chunks; the boundary frames of
+        each chunk are dropped, which is exact away from edges because the
+        stride tower is shift-invariant on HOP-aligned windows."""
+        total = waveform.shape[-1]
+        if total <= chunk_samples + 2 * overlap_samples:
+            return self._encode_whole(waveform, sample_posterior)
+        pieces = []
+        for start in range(0, total, chunk_samples):
+            lead_start = max(0, start - overlap_samples)
+            end = min(total, start + chunk_samples)
+            tail_end = min(total, end + overlap_samples)
+            latent = self._encode_whole(waveform[..., lead_start:tail_end], sample_posterior)
+            lead = (start - lead_start) // HOP
+            tail = (tail_end - end) // HOP
+            pieces.append(latent[..., lead : latent.shape[-1] - tail if tail else None])
+        return torch.cat(pieces, dim=-1)
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
