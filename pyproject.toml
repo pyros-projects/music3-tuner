@@ -24,6 +24,7 @@ dev = ["pytest>=8"]
 [project.scripts]
 music3-cache-audio = "music3_tuner.cache_audio:main"
 music3-encode = "music3_tuner.encoder:main"
+music3-gen = "music3_tuner.gen:main"
 music3-generate-codes = "music3_tuner.generate_codes:main"
 music3-prepare-pairs = "music3_tuner.pairs:main"
 music3-synth = "music3_tuner.synth:main"

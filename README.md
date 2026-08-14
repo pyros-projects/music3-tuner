@@ -35,6 +35,10 @@ already in place and testable with model-generated codes.
 ```bash
 uv sync
 
+# 0. just generate a track
+uv run music3-gen --prompt "dark synthwave, driving bass, 120 bpm" --seconds 30
+uv run music3-gen -p "..." -l "[Verse]\nneon lights ahead\n[Chorus]\nwe run tonight" -s 60 --seed 7
+
 # 1. verify the DAV port against real audio (writes *_roundtrip.wav)
 uv run music3-cache-audio ~/music/ace/audio/wav_neon --seconds 20 --roundtrip
 
