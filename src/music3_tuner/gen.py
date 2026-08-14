@@ -74,11 +74,13 @@ def main() -> None:
     components = load_synthesis_components(device=args.device)
 
     prompt_ids = encode_prompt(tokenizer, args.prompt, args.lyrics)
-    codes = generate(model, prompt_ids, int(args.seconds * 25), args.seed, args.device)
+    result = generate(model, prompt_ids, int(args.seconds * 25), args.seed, args.device)
+    codes = result.codes
     hiddens = collect_frame_hiddens(
         model,
         torch.tensor([prompt_ids], device=args.device),
         codes.unsqueeze(0).to(args.device),
+        primer_codes=result.primer_codes.unsqueeze(0).to(args.device),
     )
     generator = torch.Generator(device=args.device).manual_seed(args.seed)
     waveform = synthesize(

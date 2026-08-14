@@ -12,6 +12,7 @@ prompt), top-k 50, c0 vocab-masked to audio slots + <|audio_end|>.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -20,10 +21,18 @@ from tqdm import tqdm
 
 from .dataset import compose_caption, parse_sidecar
 from .loading import load_music3_ar, load_tokenizer
-from .prompt import AUDIO_CODE_OFFSET, C0_VOCAB_SIZE, SPECIAL_TOKEN_IDS, encode_prompt, uncond_ids
+from .prompt import AUDIO_CODE_OFFSET, C0_VOCAB_SIZE, MAX_AUDIO_FRAMES, encode_prompt, uncond_ids
 
 CFG_SCALE = 1.5
 TOP_K = 50
+CACHE_VERSION = "2"
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    codes: torch.Tensor  # emitted audio frames [T, 8]
+    primer_codes: torch.Tensor  # one non-emitted warm-up frame [1, 8]
+    ended: bool  # True only when the model sampled <|audio_end|>
 
 
 def sample_topk(logits: torch.Tensor, top_k: int, generator: torch.Generator) -> torch.Tensor:
@@ -34,9 +43,11 @@ def sample_topk(logits: torch.Tensor, top_k: int, generator: torch.Generator) ->
 
 
 @torch.no_grad()
-def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) -> torch.Tensor:
+def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) -> GenerationResult:
     from transformers import DynamicCache
 
+    if not 1 <= max_frames <= MAX_AUDIO_FRAMES:
+        raise ValueError(f"max_frames must be between 1 and {MAX_AUDIO_FRAMES}, got {max_frames}")
     cfg = model.cfg
     generator = torch.Generator(device=device).manual_seed(seed)
     conditioned = torch.tensor(prompt, device=device)
@@ -50,7 +61,11 @@ def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) 
 
     cache = DynamicCache()
     frames: list[torch.Tensor] = []
-    for _ in tqdm(range(max_frames), desc="AR sampling"):
+    primer_codes = None
+    ended = False
+    # Reference contract: the first sampled frame is fed back as a primer but
+    # is not emitted. Generation therefore takes at most max_frames + 1 steps.
+    for _ in tqdm(range(max_frames + 1), desc="AR sampling"):
         output = model.lm.get_decoder()(inputs_embeds=embeds, past_key_values=cache, use_cache=True)
         cache = output.past_key_values
         hidden = output.last_hidden_state[:, -1]
@@ -62,6 +77,7 @@ def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) 
         guided = guided.masked_fill(logits[0:1] < threshold, -float("inf"))
         token = sample_topk(guided, TOP_K, generator)
         if int(token.item()) == cfg.audio_end_token:
+            ended = True
             break
         c0 = (token - AUDIO_CODE_OFFSET).repeat(2)
 
@@ -81,12 +97,31 @@ def generate(model, prompt: list[int], max_frames: int, seed: int, device: str) 
                 sequence.append(decoder.projection(embedding.to(hidden.dtype)).unsqueeze(1))
 
         frame = torch.stack(codes, dim=1)  # [2, 8]
-        frames.append(frame[0].cpu())
+        if primer_codes is None:
+            primer_codes = frame[0].cpu().unsqueeze(0)
+        else:
+            frames.append(frame[0].cpu())
+            if len(frames) >= max_frames:
+                break
         embeds = model.embed_frames(frame.unsqueeze(1))
 
     if not frames:
         raise RuntimeError("zero frames generated")
-    return torch.stack(frames)  # [T, 8]
+    assert primer_codes is not None
+    return GenerationResult(torch.stack(frames), primer_codes, ended)
+
+
+def generation_metadata(
+    result: GenerationResult, *, caption: str, lyrics: str, max_frames: int, seed: int
+) -> dict[str, str]:
+    return {
+        "caption": caption,
+        "lyrics": lyrics,
+        "cache_version": CACHE_VERSION,
+        "termination": "audio_end" if result.ended else "max_frames",
+        "max_frames": str(max_frames),
+        "seed": str(seed),
+    }
 
 
 # Generic section-tagged lyric sets for template-driven corpus generation
@@ -173,13 +208,22 @@ def main() -> None:
         if target.exists():  # idempotent corpus runs: resume after interruption
             continue
         prompt = encode_prompt(tokenizer, caption, lyrics)
-        codes = generate(model, prompt, max_frames, seed, args.device)
+        result = generate(model, prompt, max_frames, seed, args.device)
         save_file(
-            {"codes": codes.to(torch.int32)},
+            {
+                "codes": result.codes.to(torch.int32),
+                "primer_codes": result.primer_codes.to(torch.int32),
+            },
             str(target),
-            metadata={"caption": caption, "lyrics": lyrics},
+            metadata=generation_metadata(
+                result, caption=caption, lyrics=lyrics, max_frames=max_frames, seed=seed
+            ),
         )
-        print(f"{target.stem}: {codes.shape[0]} frames ({codes.shape[0] / 25:.1f}s)")
+        print(
+            f"{target.stem}: {result.codes.shape[0]} frames "
+            f"({result.codes.shape[0] / 25:.1f}s, "
+            f"{'natural end' if result.ended else 'capped'})"
+        )
 
 
 if __name__ == "__main__":

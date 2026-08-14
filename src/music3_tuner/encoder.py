@@ -33,6 +33,7 @@ class CodesEncoder(nn.Module):
         audio_vocab: int = 1024,
         num_codebooks: int = 8,
         dropout: float = 0.2,
+        window: int = 512,
     ):
         super().__init__()
         self.config = {
@@ -45,6 +46,7 @@ class CodesEncoder(nn.Module):
             "audio_vocab": audio_vocab,
             "num_codebooks": num_codebooks,
             "dropout": dropout,
+            "window": window,
         }
         self.stem = nn.Sequential(
             nn.Conv1d(latent_dim, d_model, kernel_size=5, padding=2),
@@ -134,6 +136,14 @@ def load_encoder(out_dir: Path, device: str = "cpu") -> CodesEncoder:
     from safetensors.torch import load_file
 
     config = json.loads((Path(out_dir) / "config.json").read_text())
+    if "window" not in config:
+        import warnings
+
+        warnings.warn(
+            "legacy encoder config has no training window; assuming 512",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     model = CodesEncoder(**config)
     model.load_state_dict(load_file(str(Path(out_dir) / "encoder.safetensors")))
     return model.to(device).eval()
@@ -141,39 +151,50 @@ def load_encoder(out_dir: Path, device: str = "cpu") -> CodesEncoder:
 
 @torch.no_grad()
 def windowed_logprobs(
-    encoder: CodesEncoder, features: torch.Tensor, num_frames: int, window: int = 512
+    encoder: CodesEncoder, features: torch.Tensor, num_frames: int, window: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Averaged log-probs over half-overlapping windows.
+    """Coherent averaged log-probs over half-overlapping windows.
 
     Windows are the training crop length (positions don't extrapolate);
-    frames covered by two windows get their log-probs averaged (test-time
-    logit averaging — every prediction sees context on both sides).
+    c0 is averaged and finalized first, then acoustic logits are recomputed
+    with that same final c0 conditioning in every overlapping window.
     Returns (c0 [T, c0_vocab], acoustic [T, books-1, audio_vocab])."""
     cfg = encoder.config
     device = features.device
+    window = cfg.get("window", 512) if window is None else window
+    if window <= 0:
+        raise ValueError(f"window must be positive, got {window}")
     c0_sum = torch.zeros(num_frames, cfg["c0_vocab"], device=device)
-    acoustic_sum = torch.zeros(
-        num_frames, cfg["num_codebooks"] - 1, cfg["audio_vocab"], device=device
-    )
     counts = torch.zeros(num_frames, device=device)
 
     hop = max(1, window // 2)
     starts = list(range(0, max(num_frames - window, 0) + 1, hop))
     if not starts or starts[-1] + window < num_frames:
         starts.append(max(0, num_frames - window))
-    for start in dict.fromkeys(starts):
+    starts = list(dict.fromkeys(starts))
+    for start in starts:
         end = min(start + window, num_frames)
         chunk = features[:, start * FEATURE_RATE : end * FEATURE_RATE].unsqueeze(0)
-        c0_logits, acoustic_logits = encoder(chunk)
+        c0_logits, _ = encoder(chunk)
         c0_sum[start:end] += F.log_softmax(c0_logits.squeeze(0).float(), dim=-1)
-        acoustic_sum[start:end] += F.log_softmax(acoustic_logits.squeeze(0).float(), dim=-1)
         counts[start:end] += 1
-    return c0_sum / counts[:, None], acoustic_sum / counts[:, None, None]
+    c0_logprobs = c0_sum / counts[:, None]
+    c0_ids = c0_logprobs.argmax(-1)
+
+    acoustic_sum = torch.zeros(
+        num_frames, cfg["num_codebooks"] - 1, cfg["audio_vocab"], device=device
+    )
+    for start in starts:
+        end = min(start + window, num_frames)
+        chunk = features[:, start * FEATURE_RATE : end * FEATURE_RATE].unsqueeze(0)
+        _, acoustic_logits = encoder(chunk, c0_teacher=c0_ids[start:end].unsqueeze(0))
+        acoustic_sum[start:end] += F.log_softmax(acoustic_logits.squeeze(0).float(), dim=-1)
+    return c0_logprobs, acoustic_sum / counts[:, None, None]
 
 
 @torch.no_grad()
 def encode_wav_to_logprobs(
-    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """wav → DAV latent → windowed encoder log-probs (c0, acoustic)."""
     from .cache_audio import load_wav_44k_stereo
@@ -194,7 +215,7 @@ def logprobs_to_codes(c0_logprobs: torch.Tensor, acoustic_logprobs: torch.Tensor
 
 @torch.no_grad()
 def encode_wav_to_codes(
-    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int | None = None
 ) -> torch.Tensor:
     """wav → predicted codes [T, 8] (argmax of the averaged window log-probs)."""
     c0_logprobs, acoustic_logprobs = encode_wav_to_logprobs(wav_path, encoder, dav, device, window)

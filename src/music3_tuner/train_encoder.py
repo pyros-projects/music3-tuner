@@ -5,8 +5,9 @@ v1 recipe (all software-side, same corpus): RVQ-factorized acoustic heads
 smoothing, latent-noise + stereo-swap augmentation. Rich live UI + JSONL
 metrics log (out/train_log.jsonl) for later plotting.
 
-Validation is honest inference (no c0 teacher): per-codebook top-1/top-5
-against chance (c0: 1/16384, acoustic: 1/1024).
+Validation runs complete tracks through the same overlapping-window inference
+path (no c0 teacher): per-codebook top-1/top-5 against chance (c0: 1/16384,
+acoustic: 1/1024).
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import hashlib
 import json
 import math
 import random
+import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -34,7 +37,7 @@ from rich.progress import (
 from rich.table import Table
 from torch.utils.data import DataLoader, Dataset
 
-from .encoder import FEATURE_RATE, CodesEncoder, latent_to_features, save_encoder
+from .encoder import FEATURE_RATE, CodesEncoder, latent_to_features, save_encoder, windowed_logprobs
 from .train import arm_vram_watchdog
 
 console = Console()
@@ -45,7 +48,6 @@ class PairsDataset(Dataset):
         self,
         paths: list[Path],
         crop_frames: int,
-        seed: int = 0,
         train: bool = True,
         augment: bool = True,
     ):
@@ -53,7 +55,6 @@ class PairsDataset(Dataset):
         self.crop = crop_frames
         self.train = train
         self.augment = augment and train
-        self.rng = random.Random(seed)
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -66,26 +67,29 @@ class PairsDataset(Dataset):
             codes = f.get_tensor("codes").long()
         if self.augment:
             half = latent.shape[0] // 2
-            if self.rng.random() < 0.5:  # stereo swap: latent is [L(64), R(64)]
+            if random.random() < 0.5:  # DataLoader seeds Python's RNG independently per worker
                 latent = torch.cat([latent[half:], latent[:half]])
-            if self.rng.random() < 0.5:  # domain-gap robustness (synthetic → real audio)
-                latent = latent + torch.randn_like(latent) * latent.std() * self.rng.uniform(0.01, 0.08)
+            if random.random() < 0.5:  # domain-gap robustness (synthetic → real audio)
+                latent = (
+                    latent
+                    + torch.randn_like(latent) * latent.std() * random.uniform(0.01, 0.08)
+                )
         frames = codes.shape[0]
         features = latent_to_features(latent, frames)  # [128, 4*T]
-        crop = min(self.crop, frames)
-        start = self.rng.randrange(frames - crop + 1) if (self.train and frames > crop) else 0
+        crop = min(self.crop, frames) if self.train else frames
+        start = random.randrange(frames - crop + 1) if (self.train and frames > crop) else 0
         features = features[:, start * FEATURE_RATE : (start + crop) * FEATURE_RATE]
         if self.augment:
             # SpecAugment-style masking — the anti-memorization lever: force
             # the model to infer codes from context instead of lookup.
             features = features.clone()
             for _ in range(2):  # time masks (up to ~1.6s each)
-                width = self.rng.randrange(1, 40) * FEATURE_RATE
-                begin = self.rng.randrange(max(1, features.shape[1] - width))
+                width = random.randrange(1, 40) * FEATURE_RATE
+                begin = random.randrange(max(1, features.shape[1] - width))
                 features[:, begin : begin + width] = 0.0
             for _ in range(2):  # latent-channel masks
-                width = self.rng.randrange(1, 16)
-                begin = self.rng.randrange(max(1, features.shape[0] - width))
+                width = random.randrange(1, 16)
+                begin = random.randrange(max(1, features.shape[0] - width))
                 features[begin : begin + width] = 0.0
         return {
             "features": features,
@@ -101,13 +105,38 @@ def collate(items: list[dict]) -> dict:
     }
 
 
+def pair_family(path: Path) -> str:
+    """Corpus identity shared by seed variants such as ``track_s1`` and ``track_s2``."""
+    return re.sub(r"_s\d+$", "", path.stem)
+
+
 def split_pairs(pairs_dir: Path, val_fraction: float) -> tuple[list[Path], list[Path]]:
-    """Stable track-level split by stem hash — a track is never in both sets."""
+    """Stable template-family split — seed variants never cross the boundary."""
     train, val = [], []
     for path in sorted(pairs_dir.glob("*.safetensors")):
-        digest = int(hashlib.blake2b(path.stem.encode(), digest_size=4).hexdigest(), 16)
+        digest = int(hashlib.blake2b(pair_family(path).encode(), digest_size=4).hexdigest(), 16)
         (val if digest % 1000 < val_fraction * 1000 else train).append(path)
     return train, val
+
+
+def select_ar_panel(paths: list[Path], count: int, seed: int) -> list[Path]:
+    """Stable seeded sample of distinct validation families for AR diagnostics."""
+    if count <= 0:
+        raise ValueError("ar_tracks must be positive")
+    representatives: dict[str, Path] = {}
+    for path in sorted(paths):
+        representatives.setdefault(pair_family(path), path)
+    return sorted(
+        representatives.values(),
+        key=lambda path: hashlib.blake2b(
+            f"{seed}:{pair_family(path)}".encode(), digest_size=8
+        ).digest(),
+    )[:count]
+
+
+def selection_score(metrics: dict) -> tuple[float, float]:
+    """Rank checkpoints by full-track label fidelity, with an acoustic tie-breaker."""
+    return metrics["c0_top1"], metrics["acoustic_top1"]
 
 
 class Ema:
@@ -131,25 +160,31 @@ class Ema:
 
 
 @torch.no_grad()
-def evaluate(model: CodesEncoder, loader: DataLoader, device: str) -> dict:
+def evaluate(model: CodesEncoder, loader: DataLoader, device: str, window: int) -> dict:
+    """Evaluate complete tracks through the same overlapping-window path as inference."""
     model.eval()
     num_books = model.config["num_codebooks"] - 1
     c0_top1 = c0_top5 = total = 0
     book_top1 = torch.zeros(num_books)
     for batch in loader:
-        features = batch["features"].to(device)
-        codes = batch["codes"].to(device)
+        if batch["features"].shape[0] != 1:
+            raise ValueError("full-track validation requires batch_size=1")
+        features = batch["features"][0].to(device)
+        codes = batch["codes"][0].to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-            c0_logits, acoustic_logits = model(features)  # honest: no c0 teacher
-        n = codes.shape[0] * codes.shape[1]
+            c0_logits, acoustic_logits = windowed_logprobs(
+                model, features, codes.shape[0], window
+            )
+        n = codes.shape[0]
         total += n
-        c0_top1 += (c0_logits.argmax(-1) == codes[..., 0]).sum().item()
+        c0_top1 += (c0_logits.argmax(-1) == codes[:, 0]).sum().item()
         top5 = c0_logits.topk(5, dim=-1).indices
-        c0_top5 += (top5 == codes[..., 0].unsqueeze(-1)).any(-1).sum().item()
-        book_top1 += (acoustic_logits.argmax(-1) == codes[..., 1:]).float().sum(dim=(0, 1)).cpu()
+        c0_top5 += (top5 == codes[:, 0].unsqueeze(-1)).any(-1).sum().item()
+        book_top1 += (acoustic_logits.argmax(-1) == codes[:, 1:]).float().sum(dim=0).cpu()
     model.train()
     books = (book_top1 / total).tolist()
     return {
+        "frames": total,
         "c0_top1": c0_top1 / total,
         "c0_top5": c0_top5 / total,
         "acoustic_top1": sum(books) / len(books),
@@ -162,6 +197,24 @@ def vram_gib(device: str) -> float:
         return 0.0
     free, total = torch.cuda.mem_get_info(torch.device(device).index or 0)
     return (total - free) / 1024**3
+
+
+def paths_fingerprint(paths: list[Path]) -> str:
+    digest = hashlib.blake2b(digest_size=8)
+    for path in sorted(paths):
+        stat = path.stat()
+        digest.update(f"{path.name}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def git_head() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    return result.stdout.strip() or None
 
 
 def main() -> None:
@@ -179,8 +232,19 @@ def main() -> None:
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--no-aug", action="store_true")
     parser.add_argument("--scheduled-max", type=float, default=0.5, help="scheduled-sampling ceiling for the acoustic c0 conditioning (ramps over the first half)")
-    parser.add_argument("--ar-select", action="store_true", help="select checkpoints by AR loss of predicted codes (loads the 8B, ~5.5GB extra VRAM)")
-    parser.add_argument("--ar-tracks", type=int, default=4, help="val tracks for the --ar-select metric")
+    parser.add_argument(
+        "--ar-diagnostic",
+        "--ar-select",
+        dest="ar_select",
+        action="store_true",
+        help=(
+            "report diagnostic AR loss on a fixed val panel (loads the 8B, ~5.5GB "
+            "extra VRAM); --ar-select is a deprecated alias"
+        ),
+    )
+    parser.add_argument(
+        "--ar-tracks", type=int, default=4, help="tracks in the fixed AR diagnostic panel"
+    )
     parser.add_argument("--d-model", type=int, default=1024)
     parser.add_argument("--layers", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -188,6 +252,7 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
     if args.device.startswith("cuda"):
         arm_vram_watchdog(args.device)
 
@@ -195,23 +260,27 @@ def main() -> None:
     if not train_paths or not val_paths:
         raise SystemExit(f"bad split: {len(train_paths)} train / {len(val_paths)} val under {args.pairs}")
 
+    data_generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
-        PairsDataset(train_paths, args.crop, args.seed, train=True, augment=not args.no_aug),
+        PairsDataset(train_paths, args.crop, train=True, augment=not args.no_aug),
         batch_size=args.batch,
         shuffle=True,
         collate_fn=collate,
         num_workers=4,
         drop_last=True,
         persistent_workers=True,
+        generator=data_generator,
     )
     val_loader = DataLoader(
         PairsDataset(val_paths, args.crop, train=False),
-        batch_size=args.batch,
+        batch_size=1,
         collate_fn=collate,
         num_workers=2,
     )
 
-    model = CodesEncoder(d_model=args.d_model, num_layers=args.layers).to(args.device)
+    model = CodesEncoder(
+        d_model=args.d_model, num_layers=args.layers, window=args.crop
+    ).to(args.device)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     ema = Ema(model, args.ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
@@ -223,7 +292,7 @@ def main() -> None:
 
         ar_tokenizer = load_tokenizer()
         ar_model = load_music3_ar(quantize=True, device=args.device, with_depth=False)
-        ar_paths = val_paths[: args.ar_tracks]
+        ar_paths = select_ar_panel(val_paths, args.ar_tracks, args.seed)
 
     @torch.no_grad()
     def ar_loss_of_current(encoder: CodesEncoder) -> float:
@@ -240,6 +309,11 @@ def main() -> None:
             with safe_open(path, framework="pt") as f:
                 latent = f.get_tensor("latent").float()
                 truth = f.get_tensor("codes")
+                primer_codes = (
+                    f.get_tensor("primer_codes").long()
+                    if "primer_codes" in f.keys()
+                    else None
+                )
                 meta = f.metadata() or {}
             frames = truth.shape[0]
             feats = latent_to_features(latent, frames).to(args.device)
@@ -251,7 +325,14 @@ def main() -> None:
                 device=args.device,
             )
             loss = ar_model.global_loss(
-                ids, predicted.unsqueeze(0).to(args.device), supervise_audio_end=False
+                ids,
+                predicted.unsqueeze(0).to(args.device),
+                supervise_audio_end=False,
+                primer_codes=(
+                    primer_codes.unsqueeze(0).to(args.device)
+                    if primer_codes is not None
+                    else None
+                ),
             )
             losses.append(loss.item())
         encoder.train()
@@ -268,10 +349,30 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     log_path = args.out / "train_log.jsonl"
     log_file = log_path.open("a")
+    run_id = str(time.time_ns())
 
     def log(record: dict) -> None:
-        log_file.write(json.dumps({"ts": round(time.time(), 1), **record}) + "\n")
+        log_file.write(
+            json.dumps({"ts": round(time.time(), 1), "run_id": run_id, **record}) + "\n"
+        )
         log_file.flush()
+
+    log(
+        {
+            "event": "run_start",
+            "git_head": git_head(),
+            "args": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in vars(args).items()
+            },
+            "pairs": {
+                "train": len(train_paths),
+                "val": len(val_paths),
+                "fingerprint": paths_fingerprint(train_paths + val_paths),
+            },
+            "ar_panel": [path.name for path in ar_paths],
+        }
+    )
 
     console.print(
         Panel.fit(
@@ -288,7 +389,7 @@ def main() -> None:
     )
 
     val_history: list[tuple[int, dict]] = []
-    best_top1 = -1.0
+    best_fidelity = (-1.0, -1.0)
     best_ar = float("inf")
     step = 0
     columns = [
@@ -348,21 +449,25 @@ def main() -> None:
 
                 if step % args.val_every == 0 or step == args.steps:
                     backup = ema.copy_to(model)
-                    metrics = evaluate(model, val_loader, args.device)
+                    metrics = evaluate(model, val_loader, args.device, args.crop)
                     if args.ar_select:
                         metrics["ar_loss"] = ar_loss_of_current(model)
-                    is_best = (
-                        metrics["ar_loss"] < best_ar
-                        if args.ar_select
-                        else metrics["c0_top1"] > best_top1
-                    )
+                        best_ar = min(best_ar, metrics["ar_loss"])
+                    score = selection_score(metrics)
+                    is_best = score > best_fidelity
                     if is_best:
-                        best_ar = metrics.get("ar_loss", best_ar)
+                        best_fidelity = score
                         save_encoder(model, args.out)
                     model.load_state_dict(backup)
-                    best_top1 = max(best_top1, metrics["c0_top1"])
                     val_history.append((step, metrics))
-                    log({"step": step, "val": metrics})
+                    log(
+                        {
+                            "step": step,
+                            "val": metrics,
+                            "saved": is_best,
+                            "selection_metric": "c0_top1_then_acoustic_top1",
+                        }
+                    )
                     books = "/".join(f"{b:.1%}" for b in metrics["books"])
                     ar_part = (
                         f"  ar [bold yellow]{metrics['ar_loss']:.2f}[/bold yellow]"
@@ -378,7 +483,9 @@ def main() -> None:
                         f"[dim]({books})[/dim]{ar_part}{marker}"
                     )
 
-    table = Table(title="validation history (EMA weights, no c0 teacher)", border_style="dim")
+    table = Table(
+        title="full-track validation (EMA weights, overlapping windows)", border_style="dim"
+    )
     table.add_column("step", justify="right")
     table.add_column("c0 top-1", justify="right")
     table.add_column("c0 top-5", justify="right")
@@ -391,9 +498,17 @@ def main() -> None:
             f"{metrics['acoustic_top1']:.1%}",
         )
     console.print(table)
-    summary = f"best val c0 top-1: [bold green]{best_top1:.1%}[/bold green]  (chance {1 / 16384:.3%})"
+    summary = (
+        "selected full-track fidelity: "
+        f"c0 [bold green]{best_fidelity[0]:.1%}[/bold green] / "
+        f"acoustic [bold green]{best_fidelity[1]:.1%}[/bold green]  "
+        f"(c0 chance {1 / 16384:.3%})"
+    )
     if args.ar_select:
-        summary += f"\nbest AR loss (selection metric): [bold green]{best_ar:.3f}[/bold green]  (model-own ≈ 2, random ≈ 9.7)"
+        summary += (
+            f"\nbest diagnostic AR loss: [bold yellow]{best_ar:.3f}[/bold yellow]  "
+            "(not used for selection; model-own ≈ 2, random ≈ 9.7)"
+        )
     console.print(Panel.fit(summary + f"\nencoder saved to [cyan]{args.out}[/cyan]", border_style="green"))
     log_file.close()
 

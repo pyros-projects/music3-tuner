@@ -38,6 +38,12 @@ def snr_db(reference: torch.Tensor, estimate: torch.Tensor) -> float:
     return float(10 * torch.log10(reference.pow(2).mean() / noise.pow(2).mean().clamp_min(1e-12)))
 
 
+def correlation(reference: torch.Tensor, estimate: torch.Tensor) -> float:
+    length = min(reference.shape[-1], estimate.shape[-1])
+    reference, estimate = reference[..., :length], estimate[..., :length]
+    return float(torch.corrcoef(torch.stack([reference.flatten(), estimate.flatten()]))[0, 1])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio_dir", type=Path)
@@ -65,16 +71,7 @@ def main() -> None:
         if args.roundtrip:
             decoded = dav.decode(latent)
             score = snr_db(waveform.cpu(), decoded.cpu())
-            corr = float(
-                torch.corrcoef(
-                    torch.stack(
-                        [
-                            waveform.cpu().flatten()[: decoded.numel()],
-                            decoded.cpu().flatten()[: waveform.numel()],
-                        ]
-                    )
-                )[0, 1]
-            )
+            corr = correlation(waveform.cpu(), decoded.cpu())
             soundfile.write(
                 str(args.out / f"{wav_path.stem}_roundtrip.wav"),
                 decoded.squeeze(0).clamp(-1, 1).cpu().float().numpy().T,

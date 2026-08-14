@@ -32,6 +32,11 @@ the inverse mapping. Proven feasible (see Results).
 - prompt template (whitespace-exact):
   `<|im_start|><|caption_start|>{caption}<|caption_end|><|lyrics_start|>[start]\n{lyrics}<|lyrics_end|><|im_end|><|audio_start|>`
 - AR inference CFG 1.5 / top-k 50; uncond = ids[1:-2] → `<|audio_cfg|>` (151654)
+- the first sampled 8-code frame is a **non-emitted primer**: feed it back to
+  advance past `<|audio_start|>`, then emit up to the requested frame count.
+  V2 caches store it separately as `primer_codes [1,8]`; `codes [T,8]`
+  contains emitted audio frames only. Legacy caches without a primer remain
+  readable under their original direct-frame alignment.
 - synthesis conditioning per frame = concat of **8×4096 hiddens**: the LM
   state that *predicted* the frame (cond stream) + the 7 depth-decoder
   outputs (positions 1..7)
@@ -63,12 +68,15 @@ the inverse mapping. Proven feasible (see Results).
 
 ## Current state & results (2026-08-14)
 
-- Corpus: 1000 model-generated (audio, codes) pairs (30 s each, ≈8 h),
-  from the official caption templates; cache format: safetensors
-  `{codes [T,8] int32}` + metadata `{caption, lyrics}`
-- Encoder v1 (178M, c0-conditioned acoustic heads): **val c0 top-1 ~27%,
-  top-5 ~57%, acoustic ~2.7%** — this is the 1000-pair data ceiling;
-  longer/bigger training overfits (peak ~step 2000, schedule is 4000 steps)
+- Live legacy corpus: 1157 model-generated (audio, codes) pairs, 12.21 h / 1.10M
+  frames, from 1000 official caption templates plus 157 seed variants. Future
+  V2 caches add `primer_codes` and explicit `termination` metadata; do not
+  silently reinterpret or overwrite the legacy WAV/pair artifacts.
+- Encoder v1 (178M, c0-conditioned acoustic heads), recomputed over complete
+  overlapping windows on the historically clean 46-track holdout: **c0
+  top-1 29.26%, top-5 61.88%, acoustic 3.07%**. Offset 0 decisively wins a
+  −4…+4 alignment sweep. Longer/bigger runs still overfit near step 2000–2500;
+  the next controlled retrain must use the corrected grouped validation.
 - AR-loss ladder (teacher-forced, the quality currency): model-own codes
   **1.8–2.1**, encoder-v1 codes on real audio **5.7**, random **9.7**;
   self-prediction ≈ 2 is the sanity anchor — if a refactor moves it to ~9.7,
@@ -96,9 +104,10 @@ the inverse mapping. Proven feasible (see Results).
 2. **DAV encode VRAM**: full-resolution convs over a 4-min track spike to
    24 GB — `MusicDav.encode` chunks (~30 s HOP-aligned, shift-invariant,
    chunked==whole verified in tests); don't bypass it
-3. **Encoder inference must be windowed** at the training crop length
-   (sinusoidal positions don't extrapolate) — `encode_wav_to_codes` handles
-   overlap-centered windows
+3. **Encoder inference must be windowed** at the saved training crop length
+   (sinusoidal positions don't extrapolate) — `encode_wav_to_codes` averages
+   c0 first, then recomputes overlapping acoustic predictions using that one
+   finalized c0 sequence
 4. **torchaudio ≥2.9 needs torchcodec for I/O** — this repo uses soundfile
 5. **transformers v5 `rope_parameters`**: `loading._fix_rope` patches
    rope_theta for older versions; theta is 1e6, silent default is 10000
@@ -119,19 +128,21 @@ the inverse mapping. Proven feasible (see Results).
   dominate, and the listening verdict preferred the unrefined decode. Keep
   refine OFF for reconstruction judging; AR loss is diagnosis, not a decode
   objective. Refined codes remain an open experiment as LoRA training data.**
-- windowed inference now **averages log-probs across half-overlapping
-  windows** (was: keep-center-only)
+- windowed inference now **averages c0 across half-overlapping windows first**,
+  then runs a coherent second acoustic pass conditioned on the finalized c0
 - `music3-train-encoder --scheduled-max 0.5` (default on): scheduled
   sampling for the acoustic c0 conditioning — fixes the teacher/inference
   exposure bias; per-book acoustic accuracies are logged and printed
-- `music3-train-encoder --ar-select`: checkpoint selection by teacher-forced
-  AR loss of predicted codes (the downstream currency) instead of c0 top-1;
-  loads the 8B alongside (~5.5 GB extra)
+- `music3-train-encoder --ar-diagnostic` logs teacher-forced AR loss on a
+  deterministic, family-diverse panel; it is not used for checkpoint selection
+  because lower prior loss can Goodhart reconstruction. `--ar-select` remains
+  a deprecated alias. Full-track c0 fidelity selects, acoustic fidelity breaks ties.
 
 ## Open threads
 
-- Encoder ceiling is data-bound: next jump = bigger corpus (pod runs with
-  `M3_SECONDS=120`, multi-seed) — infra is ready and resumable
+- Next step is a short same-corpus retrain with corrected grouped/full-track
+  validation and independent worker RNG; do not expand the corpus until that
+  establishes the remaining software ceiling
 - Phase-2 depth-decoder finetune is wired (`ar.py:depth_loss`) but untrained
 - LoRA-on-real-audio waits on encoder quality (target: AR loss ≤ ~4)
 - Caption dropout (`--uncond-p`) keeps the AR's CFG uncond stream calibrated

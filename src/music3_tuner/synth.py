@@ -56,19 +56,36 @@ def collect_frame_hiddens(
     prompt_ids: torch.Tensor,
     codes: torch.Tensor,
     depth_chunk: int = 512,
+    primer_codes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Teacher-force [prompt, frames] and rebuild the per-frame conditioning.
 
-    prompt_ids [1, P] (unpadded, conditional prompt), codes [1, T, 8] →
-    frame_hiddens [1, T, 8 * hidden]. Slice 0 is the LM state at the position
-    that predicted frame t (last prompt token for t=0, frame t-1 after), the
-    rest are the depth-decoder hiddens for codebooks 1..7.
+    prompt_ids [1, P] (unpadded, conditional prompt), codes [1, T, 8], and an
+    optional official primer [1, 1, 8] → frame_hiddens [1, T, 8 * hidden].
+    Slice 0 is the LM state that predicted emitted frame t: the primer hidden
+    for official caches, or the legacy last-prompt/frame-t-1 alignment when no
+    primer is available. The remaining slices are depth-decoder hiddens.
     """
     prompt_len = prompt_ids.shape[1]
     frames = codes.shape[1]
-    embeds = torch.cat([model._embed_tokens(prompt_ids), model.embed_frames(codes)], dim=1)
+    if primer_codes is not None:
+        expected = (codes.shape[0], 1, model.cfg.num_codebooks)
+        if primer_codes.shape != expected:
+            raise ValueError(
+                f"primer_codes must have shape {expected}, got {tuple(primer_codes.shape)}"
+            )
+        audio_codes = torch.cat([primer_codes, codes], dim=1)
+        predictor_offset = 1
+    else:
+        audio_codes = codes
+        predictor_offset = 0
+
+    embeds = torch.cat(
+        [model._embed_tokens(prompt_ids), model.embed_frames(audio_codes)], dim=1
+    )
     hidden = model.lm.get_decoder()(inputs_embeds=embeds, use_cache=False).last_hidden_state
-    lm_hidden = hidden[:, prompt_len - 1 : prompt_len + frames - 1]  # [1, T, H]
+    predictor_start = prompt_len - 1 + predictor_offset
+    lm_hidden = hidden[:, predictor_start : predictor_start + frames]  # [1, T, H]
 
     depth_parts = []
     flat_hidden, flat_codes = lm_hidden.squeeze(0), codes.squeeze(0)
@@ -212,12 +229,22 @@ def main() -> None:
             continue
         with safe_open(path, framework="pt") as f:
             codes = f.get_tensor("codes").long()
+            primer_codes = (
+                f.get_tensor("primer_codes").long() if "primer_codes" in f.keys() else None
+            )
             meta = f.metadata() or {}
         prompt_ids = torch.tensor(
             [encode_prompt(tokenizer, meta.get("caption", ""), meta.get("lyrics", ""))],
             device=args.device,
         )
-        hiddens = collect_frame_hiddens(model, prompt_ids, codes.unsqueeze(0).to(args.device))
+        hiddens = collect_frame_hiddens(
+            model,
+            prompt_ids,
+            codes.unsqueeze(0).to(args.device),
+            primer_codes=(
+                primer_codes.unsqueeze(0).to(args.device) if primer_codes is not None else None
+            ),
+        )
         generator = torch.Generator(device=args.device).manual_seed(args.seed)
         waveform = synthesize(
             hiddens, *components, generator=generator, num_steps=args.steps, cfg_scale=args.cfg

@@ -180,27 +180,57 @@ class Music3AR(nn.Module):
         codes: torch.Tensor,
         prompt_mask: torch.Tensor | None = None,
         supervise_audio_end: bool = True,
+        primer_codes: torch.Tensor | None = None,
+        primer_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Teacher-forced CE for the global LM (codebook-0 prediction).
 
         prompt_ids [B, P] must be LEFT-padded (prompt_mask False on pads) so
-        the last prompt token sits at position P-1 for every item and frames
-        start contiguously at P. The hidden at the last prompt position
-        predicts frame 0's c0; the hidden at frame t predicts frame t+1's c0;
-        the hidden at the last frame predicts <|audio_end|>.
+        the last prompt token sits at position P-1 for every item. With an
+        official primer [B, 1, 8], that hidden predicts the primer and the
+        primer hidden predicts emitted frame 0. Legacy rows skip the primer,
+        preserving the old prompt-hidden → frame-0 alignment. ``primer_mask``
+        selects official rows when a batch mixes both cache formats.
         """
         cfg = self.cfg
         batch, prompt_len = prompt_ids.shape
         frames = codes.shape[1]
         prompt_embeds = self._embed_tokens(prompt_ids)
-        frame_embeds = self.embed_frames(codes)
-        embeds = torch.cat([prompt_embeds, frame_embeds], dim=1)
 
         if prompt_mask is None:
             prompt_mask = torch.ones_like(prompt_ids, dtype=torch.bool)
-        attention_mask = torch.cat(
-            [prompt_mask, torch.ones(batch, frames, dtype=torch.bool, device=codes.device)], dim=1
-        )
+
+        if primer_codes is None:
+            if primer_mask is not None:
+                raise ValueError("primer_mask requires primer_codes")
+            audio_codes = codes
+            audio_mask = torch.ones(batch, frames, dtype=torch.bool, device=codes.device)
+        else:
+            if primer_codes.shape != (batch, 1, cfg.num_codebooks):
+                raise ValueError(
+                    f"primer_codes must have shape {(batch, 1, cfg.num_codebooks)}, "
+                    f"got {tuple(primer_codes.shape)}"
+                )
+            if primer_mask is None:
+                primer_mask = torch.ones(batch, dtype=torch.bool, device=codes.device)
+            else:
+                primer_mask = primer_mask.to(device=codes.device, dtype=torch.bool)
+                if primer_mask.shape != (batch,):
+                    raise ValueError(
+                        f"primer_mask must have shape {(batch,)}, got {tuple(primer_mask.shape)}"
+                    )
+
+            official_codes = torch.cat([primer_codes, codes], dim=1)
+            legacy_codes = torch.cat([codes, torch.zeros_like(primer_codes)], dim=1)
+            audio_codes = torch.where(
+                primer_mask[:, None, None], official_codes, legacy_codes
+            )
+            audio_mask = torch.ones(batch, frames + 1, dtype=torch.bool, device=codes.device)
+            audio_mask[~primer_mask, -1] = False
+
+        audio_embeds = self.embed_frames(audio_codes)
+        embeds = torch.cat([prompt_embeds, audio_embeds], dim=1)
+        attention_mask = torch.cat([prompt_mask, audio_mask], dim=1)
         # left-padding shifts real positions; keep RoPE indices contiguous
         position_ids = (attention_mask.long().cumsum(dim=1) - 1).clamp(min=0)
 
@@ -211,9 +241,18 @@ class Music3AR(nn.Module):
 
         # shifted[b, i] = token the hidden at position i must predict (next token)
         shifted = torch.full(embeds.shape[:2], -100, dtype=torch.long, device=codes.device)
-        shifted[:, prompt_len - 1 : prompt_len + frames - 1] = codes[..., 0] + cfg.audio_code_offset
+        shifted[:, prompt_len - 1 : prompt_len + audio_codes.shape[1] - 1] = (
+            audio_codes[..., 0] + cfg.audio_code_offset
+        )
+        if primer_mask is not None:
+            shifted[~primer_mask, prompt_len + frames - 1] = -100
         if supervise_audio_end:
-            shifted[:, prompt_len + frames - 1] = cfg.audio_end_token
+            end_positions = torch.full(
+                (batch,), prompt_len + frames - 1, dtype=torch.long, device=codes.device
+            )
+            if primer_mask is not None:
+                end_positions += primer_mask.long()
+            shifted[torch.arange(batch, device=codes.device), end_positions] = cfg.audio_end_token
 
         keep = shifted != -100
         return chunked_cross_entropy(

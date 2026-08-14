@@ -20,7 +20,7 @@ from .loading import models_dir
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wavs", type=Path, default=Path("cache/wavs"))
-    parser.add_argument("--codes", type=Path, default=Path("codes_templates"))
+    parser.add_argument("--codes", type=Path, default=Path("cache/codes_templates"))
     parser.add_argument("--out", type=Path, default=Path("cache/pairs"))
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -41,11 +41,15 @@ def main() -> None:
             continue
         with safe_open(args.codes / f"{stem}.safetensors", framework="pt") as f:
             codes = f.get_tensor("codes")
+            primer_codes = f.get_tensor("primer_codes") if "primer_codes" in f.keys() else None
             meta = f.metadata() or {}
         waveform = load_wav_44k_stereo(args.wavs / f"{stem}.wav").to(args.device)
         latent = dav.encode(waveform).squeeze(0)  # [128, T_lat]
+        tensors = {"latent": latent.to(torch.float16).cpu().contiguous(), "codes": codes}
+        if primer_codes is not None:
+            tensors["primer_codes"] = primer_codes
         save_file(
-            {"latent": latent.to(torch.float16).cpu().contiguous(), "codes": codes},
+            tensors,
             str(target),
             metadata=meta,
         )

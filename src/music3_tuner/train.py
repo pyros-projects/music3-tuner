@@ -21,6 +21,13 @@ from tqdm import tqdm
 from .dataset import CodesDataset, collate_codes
 from .loading import load_music3_ar, load_tokenizer
 
+
+def _trainable_adapter_parameters(model) -> list[torch.nn.Parameter]:
+    """Return only state persisted by ``model.lm.save_pretrained``."""
+    model.audio_extra_embedding.requires_grad_(False)
+    return [parameter for parameter in model.lm.parameters() if parameter.requires_grad]
+
+
 def arm_vram_watchdog(device: str, limit_gib: float | None = None) -> None:
     """WSL2 doesn't OOM — it spills into shared memory and grinds the box.
     Hard-exit before that happens. Default limit: total - 1 GiB (23 GiB on
@@ -52,7 +59,12 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--alpha", type=int, default=16)
     parser.add_argument("--accum", type=int, default=4)
-    parser.add_argument("--max-frames", type=int, default=1500, help="random window per step")
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=1500,
+        help="maximum emitted frames (legacy caches sample random windows; primer caches keep a correct prefix)",
+    )
     parser.add_argument("--uncond-p", type=float, default=0.1, help="caption dropout → keeps the CFG uncond stream calibrated")
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--seed", type=int, default=42)
@@ -86,6 +98,7 @@ def main() -> None:
     model.lm.print_trainable_parameters()
     model.lm.gradient_checkpointing_enable()
     model.lm.enable_input_require_grads()
+    trainable = _trainable_adapter_parameters(model)
 
     dataset = CodesDataset(
         args.data, tokenizer, max_frames=args.max_frames, uncond_p=args.uncond_p, seed=args.seed
@@ -94,7 +107,6 @@ def main() -> None:
 
     import bitsandbytes as bnb
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=args.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: min(1.0, (step + 1) / 20)
@@ -112,6 +124,8 @@ def main() -> None:
                 batch.codes.to(args.device),
                 batch.prompt_mask.to(args.device),
                 supervise_audio_end=batch.supervise_audio_end,
+                primer_codes=batch.primer_codes.to(args.device),
+                primer_mask=batch.primer_mask.to(args.device),
             )
             (loss / args.accum).backward()
             running += loss.item() / args.accum
