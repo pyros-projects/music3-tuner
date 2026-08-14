@@ -44,7 +44,18 @@ def main() -> None:
     args = parser.parse_args()
 
     console = Console()
-    out = args.out or Path("out/gen") / f"{slugify(args.prompt)}-s{args.seed}.wav"
+    if args.out:
+        out = args.out
+    else:
+        # collision-proof default: prompt slug + seed + lora tag + timestamp —
+        # same-prompt A/B runs (with/without adapter) must never overwrite
+        lora_tag = ""
+        if args.lora:
+            lora_tag = f"-{args.lora.parent.name}-{args.lora.name}"
+            if args.lora_scale != 1.0:
+                lora_tag += f"-x{args.lora_scale:g}"
+        stamp = time.strftime("%m%d-%H%M%S")
+        out = Path("out/gen") / f"{slugify(args.prompt)}-s{args.seed}{lora_tag}-{stamp}.wav"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
