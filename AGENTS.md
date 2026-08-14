@@ -108,12 +108,17 @@ the inverse mapping. Proven feasible (see Results).
    cache after reading model shards — `drop_caches` or `.wslconfig`
    `autoMemoryReclaim=gradual`, not a process leak
 
-## Decode/selection extras (post-review upgrades, untested on GPU yet)
+## Decode/selection extras (post-review upgrades)
 
 - `music3-encode --refine N --refine-lambda 0.5`: AR-prior re-decoding —
   fuses the encoder's frame-local log-probs with the frozen 8B's sequential
   prior (and the depth decoder's per-book prior) via iterated conditional
-  modes. λ is a fidelity dial: verify envelope correlation when tuning.
+  modes. **Measured Goodhart trade-off (2026-08-14): λ=0.5×2 cuts real-audio
+  AR loss 5.5→4.3 but drops envelope correlation everywhere (~0.02–0.04) —
+  on out-of-domain audio the flatter encoder posteriors let the prior
+  dominate, and the listening verdict preferred the unrefined decode. Keep
+  refine OFF for reconstruction judging; AR loss is diagnosis, not a decode
+  objective. Refined codes remain an open experiment as LoRA training data.**
 - windowed inference now **averages log-probs across half-overlapping
   windows** (was: keep-center-only)
 - `music3-train-encoder --scheduled-max 0.5` (default on): scheduled
