@@ -15,6 +15,7 @@ dependencies = [
     "tqdm",
     "soundfile",
     "diffusers",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]

@@ -25,10 +25,10 @@ class CodesEncoder(nn.Module):
     def __init__(
         self,
         latent_dim: int = 128,
-        d_model: int = 768,
-        num_layers: int = 8,
-        num_heads: int = 12,
-        ff_dim: int = 3072,
+        d_model: int = 1024,
+        num_layers: int = 10,
+        num_heads: int = 16,
+        ff_dim: int = 4096,
         c0_vocab: int = 16384,
         audio_vocab: int = 1024,
         num_codebooks: int = 8,
@@ -57,10 +57,20 @@ class CodesEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers)
         self.norm = nn.LayerNorm(d_model)
         self.c0_head = nn.Linear(d_model, c0_vocab)
+        # RVQ factorization: codebooks 1..7 are residuals *given* the semantic
+        # code — condition the acoustic heads on c0 (teacher-forced in
+        # training, predicted at inference).
+        self.c0_embed = nn.Embedding(c0_vocab, d_model)
+        self.acoustic_norm = nn.LayerNorm(d_model)
         self.acoustic_head = nn.Linear(d_model, (num_codebooks - 1) * audio_vocab)
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """features [B, latent_dim, FEATURE_RATE*T] → (c0 [B,T,16384], acoustic [B,T,7,1024])."""
+    def forward(
+        self, features: torch.Tensor, c0_teacher: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """features [B, latent_dim, FEATURE_RATE*T] → (c0 [B,T,16384], acoustic [B,T,7,1024]).
+
+        c0_teacher [B, T]: ground-truth semantic codes for the acoustic
+        conditioning (training); defaults to the model's own argmax."""
         x = self.stem(features).transpose(1, 2)  # [B, T, d]
         position = torch.arange(x.shape[1], device=x.device, dtype=torch.float32)
         div = torch.exp(
@@ -75,7 +85,9 @@ class CodesEncoder(nn.Module):
         batch, frames, _ = x.shape
         c0_logits = self.c0_head(x)
         cfg = self.config
-        acoustic = self.acoustic_head(x).view(
+        c0_ids = c0_teacher if c0_teacher is not None else c0_logits.argmax(-1)
+        y = self.acoustic_norm(x + self.c0_embed(c0_ids).to(x.dtype))
+        acoustic = self.acoustic_head(y).view(
             batch, frames, cfg["num_codebooks"] - 1, cfg["audio_vocab"]
         )
         return c0_logits, acoustic
@@ -107,12 +119,13 @@ def load_encoder(out_dir: Path, device: str = "cpu") -> CodesEncoder:
 
 @torch.no_grad()
 def encode_wav_to_codes(
-    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 256
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
 ) -> torch.Tensor:
     """wav → DAV latent → predicted codes [T, 8] (argmax).
 
-    Runs in `window`-frame slices (the training crop length) — sinusoidal
-    positions and attention patterns don't extrapolate to full songs."""
+    Runs `window`-frame slices (the training crop length — positions don't
+    extrapolate) at half-window hop, keeping only each window's center region
+    so every prediction has context on both sides."""
     from .cache_audio import load_wav_44k_stereo
     from .dav import SAMPLE_RATE
 
@@ -120,14 +133,23 @@ def encode_wav_to_codes(
     latent = dav.encode(waveform).squeeze(0)
     num_frames = int(round(waveform.shape[-1] / SAMPLE_RATE * AUDIO_FRAMES_PER_SECOND))
     features = latent_to_features(latent, num_frames).to(device)
-    pieces = []
-    for start in range(0, num_frames, window):
-        chunk = features[:, start * FEATURE_RATE : (start + window) * FEATURE_RATE].unsqueeze(0)
+
+    hop, quarter = window // 2, window // 4
+    codes = torch.zeros(num_frames, encoder.config["num_codebooks"], dtype=torch.long)
+    cursor, start = 0, 0
+    while cursor < num_frames:
+        start = min(start, max(0, num_frames - window))
+        end = min(start + window, num_frames)
+        chunk = features[:, start * FEATURE_RATE : end * FEATURE_RATE].unsqueeze(0)
         c0_logits, acoustic_logits = encoder(chunk)
-        pieces.append(
-            torch.cat([c0_logits.argmax(-1).unsqueeze(-1), acoustic_logits.argmax(-1)], dim=-1)
-        )
-    return torch.cat(pieces, dim=1).squeeze(0)  # [T, 8]
+        predicted = torch.cat(
+            [c0_logits.argmax(-1).unsqueeze(-1), acoustic_logits.argmax(-1)], dim=-1
+        ).squeeze(0)
+        keep_hi = end if end == num_frames else start + window - quarter
+        codes[cursor:keep_hi] = predicted[cursor - start : keep_hi - start].cpu()
+        cursor = keep_hi
+        start += hop
+    return codes  # [T, 8]
 
 
 def main() -> None:
