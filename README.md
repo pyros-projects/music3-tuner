@@ -1,99 +1,80 @@
 # music3-tuner
 
-LoRA trainer for [MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3)'s
-Hybrid-LM — the 8B global LM (codebook-0 / musical structure) and the 0.6B RVQ
-depth decoder (codebooks 1–7 / acoustic detail). FM transformer, Flow-VAE and
-vocoder stay frozen.
-
-## The one hard fact
-
-**MiniMax did not release the audio→codes tokenizer.** The 57.4 GB repo
-contains no RVQ quantizer: `dav.pth` is a continuous Flow-VAE (no codebooks),
-the synthesis path consumes LM *hidden states* (never codes), and codes exist
-publicly only as AR **outputs**. Ground-truth codes for arbitrary training
-audio therefore require a distilled encoder — the model itself labels
-unlimited (audio, codes) pairs via generation, and an encoder is trained on
-those pairs. That inversion is Phase 0 of this repo; everything downstream is
-already in place and testable with model-generated codes.
-
-## Layout
-
-| module | what |
-|---|---|
-| `prompt.py` | template + special tokens + CFG uncond masking |
-| `dav.py` | Flow-VAE **encoder+decoder** port of `dav.pth` (44.1 kHz stereo, hop 512) |
-| `ar.py` | global LM wrapper + depth decoder, teacher-forced losses for both stages |
-| `loading.py` | tokenizer/8B(NF4)/depth-decoder loaders against `~/models/MiniMaxM3` |
-| `dataset.py` | cached code sequences + ace-style caption sidecar parser |
-| `cache_audio.py` | wav dir → DAV latents (+ `--roundtrip` SNR verification) |
-| `generate_codes.py` | AR sampling (CFG 1.5 / top-k 50) → dataset-format code caches |
-| `synth.py` | codes → audio: teacher-forced hiddens + chunked FM (CFG 1.7, 30 steps) + vocoder |
-| `train.py` | QLoRA (NF4 + peft) on the 8B, VRAM watchdog, caption dropout |
-
-## Usage
+Training + generation toolchain for [MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3)'s
+Hybrid-LM — the part the official release doesn't cover. LoRA-train the 8B
+global LM, generate tracks end-to-end, and **distill the audio→codes
+tokenizer MiniMax didn't release**.
 
 ```bash
 uv sync
-
-# 0. just generate a track
 uv run music3-gen --prompt "dark synthwave, driving bass, 120 bpm" --seconds 30
 uv run music3-gen -p "..." -l "[Verse]\nneon lights ahead\n[Chorus]\nwe run tonight" -s 60 --seed 7
-
-# 1. verify the DAV port against real audio (writes *_roundtrip.wav)
-uv run music3-cache-audio ~/music/ace/audio/wav_neon --seconds 20 --roundtrip
-
-# 2. model-labeled code caches from caption sidecars (needs 8B + rvq_depth_decoder)
-uv run music3-generate-codes ~/music/ace/audio/wav_neon --seconds 10 --limit 3
-
-# 2b. corpus generation from the 1000 official structured-caption templates
-#     (in-distribution captions = the Phase-0 data engine; fetch once via:)
-#     cd cache && git clone --depth 1 --filter=blob:none --sparse \
-#       https://github.com/MiniMax-AI/MiniMax-Music3 m3-github && \
-#       cd m3-github && git sparse-checkout set skills/music-caption-rewriter/templates
-uv run music3-generate-codes --templates cache/m3-github/skills/music-caption-rewriter/templates \
-    --shuffle --limit 50 --seconds 120 --out cache/codes_templates
-
-# 2c. codes → audio (needs transformer/vocoder/scheduler subfolders, FULL=1 on pods)
-uv run music3-synth cache/codes_templates --limit 5 --out cache/wavs
-
-# 3. QLoRA smoke on those caches
-uv run music3-train --data cache/codes --steps 50 --max-frames 250
-
-# tests (tiny-model CPU tests + weight-gated smokes)
-uv run pytest
 ```
+
+Agents/contributors: read [AGENTS.md](AGENTS.md) — checkpoint contract,
+module map, gotchas, current results.
+
+## Why a distilled encoder
+
+The 57.4 GB official release is decode-only: `dav.pth` is a continuous
+Flow-VAE (no quantizer), synthesis consumes LM hidden states, and codes exist
+publicly only as AR *outputs*. Training on real audio needs audio→codes —
+so the model labels its own (audio, codes) pairs via generation, and a small
+encoder learns the inverse. Feasibility is proven: **val c0 top-1 ~27%
+(chance 0.006%)** on 1000 self-labeled pairs, and real never-seen tracks
+survive the full code bottleneck (encode → teacher-force → FM → vocoder)
+with envelope correlation 0.75–0.93 (unrelated baseline −0.49).
+
+## Pipeline
+
+```
+                    1000 official caption templates
+                                ↓
+prompt ──► 8B AR + depth decoder ──► codes [T,8] ──► teacher-forced hiddens [T,8×4096]
+              (music3-generate-codes)                        ↓
+                                              condition fusion → chunked FM → vocoder
+                                                     (music3-synth / music3-gen)
+                                                             ↓
+real wav ──► DAV encoder ──► CodesEncoder ──► codes    44.1 kHz stereo wav
+             (music3-encode: the distilled tokenizer)
+codes + captions ──► QLoRA on the 8B (music3-train)
+```
+
+## CLIs
+
+| command | what |
+|---|---|
+| `music3-gen` | prompt → wav, one command |
+| `music3-generate-codes` | AR sampler → code caches (`--templates` = corpus engine over the 1000 official captions) |
+| `music3-synth` | code caches → wavs (the audio side of training pairs; resumable) |
+| `music3-encode` | real audio → code caches via the distilled encoder |
+| `music3-prepare-pairs` / `music3-train-encoder` | build (latent, codes) pairs / train the encoder (rich UI, JSONL log) |
+| `music3-train` | QLoRA on the 8B over code caches (NF4 + peft, VRAM watchdog) |
+| `music3-cache-audio` | DAV latents + roundtrip verification |
 
 ## RunPod
 
-One-liner on a naked GPU pod (volume at `/workspace`):
-
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/pyros-projects/music3-tuner/main/scripts/runpod_setup.sh)
-bash /workspace/music3-tuner/scripts/run_corpus.sh   # M3_SECONDS/M3_LIMIT/M3_ROUNDS/M3_SEED knobs
+FULL=1 bash <(curl -sL https://raw.githubusercontent.com/pyros-projects/music3-tuner/main/scripts/runpod_setup.sh)
+bash /workspace/music3-tuner/scripts/run_corpus.sh   # codes corpus (M3_SECONDS/LIMIT/ROUNDS/SEED)
+bash /workspace/music3-tuner/scripts/run_synth.sh    # audio side of the pairs
 ```
 
-Downloads the corpus model set (~19 GB; `FULL=1` adds the FM+vocoder stack),
-fetches the 1000 official caption templates, verifies CUDA+tokenizer, then the
-corpus engine runs detached, resumable, with auto bf16 on ≥30 GB GPUs.
+Corpus set ~19 GB, `FULL=1` adds the FM stack (~16 GB). Both launchers run
+detached and resume across pod restarts. Any ≥16 GB GPU works (NF4);
+≥30 GB auto-switches to bf16. Measured on an A40: ~10 s per 30 s track
+(synthesis), near-realtime AR sampling.
 
-## Phases
+## Status
 
-- **Phase 0 — encoder distillation** (the actual research): generate
-  (audio, codes) pairs at scale with `generate_codes.py` + the full synthesis
-  pipeline, train an audio→codes encoder (DAV latents in, 8 codebook heads
-  out). Until it exists, training data is model-generated only.
-- **Phase 1 — global-LM LoRA** (`train.py`, works today on generated codes):
-  concept/style LoRAs on the 8B. Caption dropout keeps the CFG uncond stream
-  calibrated (the H3 guidance-preservation lesson, AR flavor).
-- **Phase 2 — depth-decoder finetune** (`ar.py:depth_loss`, wired): timbre-
-  level detail, needs Phase-0 codes for real audio.
+- [x] DAV Flow-VAE port (encoder+decoder), roundtrip-verified
+- [x] AR + depth decoder port, teacher-forced losses, self-prediction sanity ≈ 2.0 CE
+- [x] codes→audio synthesis (mirrors the diffusers modular pipeline, merged upstream as #14456)
+- [x] corpus engine + 1000-pair corpus
+- [x] Phase 0 encoder v1: c0 ~27% / top-5 ~57% — data-ceiling-bound, scales with corpus
+- [x] QLoRA training loop for the 8B
+- [ ] bigger corpus (120 s clips, multi-seed) → encoder v2
+- [ ] depth-decoder finetune (loss wired, untrained)
+- [ ] first real-audio LoRA (waits on encoder AR-loss ≤ ~4; today: 5.7)
 
-## Facts (verified against ComfyUI reference + checkpoints)
-
-- 25 audio frames/s; ≤9000 frames; prompt ≤5000 tokens; positions ≤10240
-- frame embedding = `(embed(c0+151675) + Σ extra(c_k)) · 8^-0.5` — training
-  the global LM needs **all 8 codebooks**, not just c0
-- c0 vocab 16384 at offset 151675; acoustic vocab 1024 ×7; stop `<|audio_end|>`
-- inference CFG 1.5, uncond = interior→`<|audio_cfg|>`; top-k 50
-- DAV: 44.1 kHz stereo, per-channel 64-dim latent @ hop 512, stereo folded to 128
-- license: no EU exclusion (unlike MiniMax-H3)
+License note: MiniMax-Music3's license has no EU exclusion (unlike MiniMax-H3).
