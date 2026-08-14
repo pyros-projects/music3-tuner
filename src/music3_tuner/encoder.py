@@ -74,12 +74,18 @@ class CodesEncoder(nn.Module):
         self.acoustic_head = nn.Linear(d_model, (num_codebooks - 1) * audio_vocab)
 
     def forward(
-        self, features: torch.Tensor, c0_teacher: torch.Tensor | None = None
+        self,
+        features: torch.Tensor,
+        c0_teacher: torch.Tensor | None = None,
+        scheduled_p: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """features [B, latent_dim, FEATURE_RATE*T] → (c0 [B,T,16384], acoustic [B,T,7,1024]).
 
         c0_teacher [B, T]: ground-truth semantic codes for the acoustic
-        conditioning (training); defaults to the model's own argmax."""
+        conditioning (training); defaults to the model's own argmax.
+        scheduled_p: per-position probability of replacing the teacher c0
+        with the model's own prediction — scheduled sampling against the
+        train/inference exposure bias of the acoustic conditioning."""
         x = self.stem(features).transpose(1, 2)  # [B, T, d]
         position = torch.arange(x.shape[1], device=x.device, dtype=torch.float32)
         div = torch.exp(
@@ -94,7 +100,14 @@ class CodesEncoder(nn.Module):
         batch, frames, _ = x.shape
         c0_logits = self.c0_head(x)
         cfg = self.config
-        c0_ids = c0_teacher if c0_teacher is not None else c0_logits.argmax(-1)
+        if c0_teacher is None:
+            c0_ids = c0_logits.argmax(-1)
+        elif scheduled_p > 0:
+            predicted = c0_logits.detach().argmax(-1)
+            use_own = torch.rand(c0_teacher.shape, device=c0_teacher.device) < scheduled_p
+            c0_ids = torch.where(use_own, predicted, c0_teacher)
+        else:
+            c0_ids = c0_teacher
         y = self.acoustic_norm(x + self.c0_embed(c0_ids).to(x.dtype))
         acoustic = self.acoustic_head(y).view(
             batch, frames, cfg["num_codebooks"] - 1, cfg["audio_vocab"]
@@ -127,14 +140,42 @@ def load_encoder(out_dir: Path, device: str = "cpu") -> CodesEncoder:
 
 
 @torch.no_grad()
-def encode_wav_to_codes(
-    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
-) -> torch.Tensor:
-    """wav → DAV latent → predicted codes [T, 8] (argmax).
+def windowed_logprobs(
+    encoder: CodesEncoder, features: torch.Tensor, num_frames: int, window: int = 512
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Averaged log-probs over half-overlapping windows.
 
-    Runs `window`-frame slices (the training crop length — positions don't
-    extrapolate) at half-window hop, keeping only each window's center region
-    so every prediction has context on both sides."""
+    Windows are the training crop length (positions don't extrapolate);
+    frames covered by two windows get their log-probs averaged (test-time
+    logit averaging — every prediction sees context on both sides).
+    Returns (c0 [T, c0_vocab], acoustic [T, books-1, audio_vocab])."""
+    cfg = encoder.config
+    device = features.device
+    c0_sum = torch.zeros(num_frames, cfg["c0_vocab"], device=device)
+    acoustic_sum = torch.zeros(
+        num_frames, cfg["num_codebooks"] - 1, cfg["audio_vocab"], device=device
+    )
+    counts = torch.zeros(num_frames, device=device)
+
+    hop = max(1, window // 2)
+    starts = list(range(0, max(num_frames - window, 0) + 1, hop))
+    if not starts or starts[-1] + window < num_frames:
+        starts.append(max(0, num_frames - window))
+    for start in dict.fromkeys(starts):
+        end = min(start + window, num_frames)
+        chunk = features[:, start * FEATURE_RATE : end * FEATURE_RATE].unsqueeze(0)
+        c0_logits, acoustic_logits = encoder(chunk)
+        c0_sum[start:end] += F.log_softmax(c0_logits.squeeze(0).float(), dim=-1)
+        acoustic_sum[start:end] += F.log_softmax(acoustic_logits.squeeze(0).float(), dim=-1)
+        counts[start:end] += 1
+    return c0_sum / counts[:, None], acoustic_sum / counts[:, None, None]
+
+
+@torch.no_grad()
+def encode_wav_to_logprobs(
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """wav → DAV latent → windowed encoder log-probs (c0, acoustic)."""
     from .cache_audio import load_wav_44k_stereo
     from .dav import SAMPLE_RATE
 
@@ -142,23 +183,22 @@ def encode_wav_to_codes(
     latent = dav.encode(waveform).squeeze(0)
     num_frames = int(round(waveform.shape[-1] / SAMPLE_RATE * AUDIO_FRAMES_PER_SECOND))
     features = latent_to_features(latent, num_frames).to(device)
+    return windowed_logprobs(encoder, features, num_frames, window)
 
-    hop, quarter = window // 2, window // 4
-    codes = torch.zeros(num_frames, encoder.config["num_codebooks"], dtype=torch.long)
-    cursor, start = 0, 0
-    while cursor < num_frames:
-        start = min(start, max(0, num_frames - window))
-        end = min(start + window, num_frames)
-        chunk = features[:, start * FEATURE_RATE : end * FEATURE_RATE].unsqueeze(0)
-        c0_logits, acoustic_logits = encoder(chunk)
-        predicted = torch.cat(
-            [c0_logits.argmax(-1).unsqueeze(-1), acoustic_logits.argmax(-1)], dim=-1
-        ).squeeze(0)
-        keep_hi = end if end == num_frames else start + window - quarter
-        codes[cursor:keep_hi] = predicted[cursor - start : keep_hi - start].cpu()
-        cursor = keep_hi
-        start += hop
-    return codes  # [T, 8]
+
+def logprobs_to_codes(c0_logprobs: torch.Tensor, acoustic_logprobs: torch.Tensor) -> torch.Tensor:
+    return torch.cat(
+        [c0_logprobs.argmax(-1).unsqueeze(-1), acoustic_logprobs.argmax(-1)], dim=-1
+    )
+
+
+@torch.no_grad()
+def encode_wav_to_codes(
+    wav_path: Path, encoder: CodesEncoder, dav, device: str, window: int = 512
+) -> torch.Tensor:
+    """wav → predicted codes [T, 8] (argmax of the averaged window log-probs)."""
+    c0_logprobs, acoustic_logprobs = encode_wav_to_logprobs(wav_path, encoder, dav, device, window)
+    return logprobs_to_codes(c0_logprobs, acoustic_logprobs).cpu()
 
 
 def main() -> None:
@@ -177,29 +217,53 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=Path("out/encoder"))
     parser.add_argument("--out", type=Path, default=Path("cache/codes_real"))
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--refine", type=int, default=0, help="AR-prior re-decoding iterations (loads the 8B + depth decoder)")
+    parser.add_argument("--refine-lambda", type=float, default=0.5, help="prior weight — fidelity dial, verify recos when changing")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     encoder = load_encoder(args.model, device=args.device)
     dav = load_dav(str(models_dir() / "dav.pth"), device=args.device)
+    ar_model = tokenizer = None
+    if args.refine:
+        from .loading import load_music3_ar, load_tokenizer
+
+        tokenizer = load_tokenizer()
+        ar_model = load_music3_ar(quantize=True, device=args.device, with_depth=True)
     args.out.mkdir(parents=True, exist_ok=True)
 
     wavs = sorted(args.audio_dir.glob("*.wav"))
     if args.limit:
         wavs = wavs[: args.limit]
     for wav_path in wavs:
-        codes = encode_wav_to_codes(wav_path, encoder, dav, args.device)
         sidecar = wav_path.with_suffix(".txt")
         caption, lyrics = "", ""
         if sidecar.exists():
             fields = parse_sidecar(sidecar)
             caption, lyrics = compose_caption(fields), fields.get("lyrics", "")
+        c0_logprobs, acoustic_logprobs = encode_wav_to_logprobs(
+            wav_path, encoder, dav, args.device
+        )
+        if args.refine:
+            from .prompt import encode_prompt
+            from .refine import refine_codes
+
+            prompt_ids = torch.tensor(
+                [encode_prompt(tokenizer, caption, lyrics)], device=args.device
+            )
+            codes = refine_codes(
+                ar_model, prompt_ids, c0_logprobs, acoustic_logprobs,
+                lam=args.refine_lambda, iterations=args.refine,
+            )
+        else:
+            codes = logprobs_to_codes(c0_logprobs, acoustic_logprobs)
         save_file(
             {"codes": codes.to(torch.int32).cpu()},
             str(args.out / f"{wav_path.stem}.safetensors"),
             metadata={"caption": caption, "lyrics": lyrics},
         )
-        print(f"{wav_path.stem}: {codes.shape[0]} frames ({codes.shape[0] / 25:.1f}s)")
+        print(f"{wav_path.stem}: {codes.shape[0]} frames ({codes.shape[0] / 25:.1f}s)"
+              + (f" [refined x{args.refine}, λ={args.refine_lambda}]" if args.refine else ""))
 
 
 if __name__ == "__main__":

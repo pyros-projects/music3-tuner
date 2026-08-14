@@ -131,9 +131,11 @@ class Ema:
 
 
 @torch.no_grad()
-def evaluate(model: CodesEncoder, loader: DataLoader, device: str) -> dict[str, float]:
+def evaluate(model: CodesEncoder, loader: DataLoader, device: str) -> dict:
     model.eval()
-    c0_top1 = c0_top5 = acoustic_top1 = total = 0
+    num_books = model.config["num_codebooks"] - 1
+    c0_top1 = c0_top5 = total = 0
+    book_top1 = torch.zeros(num_books)
     for batch in loader:
         features = batch["features"].to(device)
         codes = batch["codes"].to(device)
@@ -144,12 +146,14 @@ def evaluate(model: CodesEncoder, loader: DataLoader, device: str) -> dict[str, 
         c0_top1 += (c0_logits.argmax(-1) == codes[..., 0]).sum().item()
         top5 = c0_logits.topk(5, dim=-1).indices
         c0_top5 += (top5 == codes[..., 0].unsqueeze(-1)).any(-1).sum().item()
-        acoustic_top1 += (acoustic_logits.argmax(-1) == codes[..., 1:]).float().mean(-1).sum().item()
+        book_top1 += (acoustic_logits.argmax(-1) == codes[..., 1:]).float().sum(dim=(0, 1)).cpu()
     model.train()
+    books = (book_top1 / total).tolist()
     return {
         "c0_top1": c0_top1 / total,
         "c0_top5": c0_top5 / total,
-        "acoustic_top1": acoustic_top1 / total,
+        "acoustic_top1": sum(books) / len(books),
+        "books": books,
     }
 
 
@@ -174,6 +178,9 @@ def main() -> None:
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--no-aug", action="store_true")
+    parser.add_argument("--scheduled-max", type=float, default=0.5, help="scheduled-sampling ceiling for the acoustic c0 conditioning (ramps over the first half)")
+    parser.add_argument("--ar-select", action="store_true", help="select checkpoints by AR loss of predicted codes (loads the 8B, ~5.5GB extra VRAM)")
+    parser.add_argument("--ar-tracks", type=int, default=4, help="val tracks for the --ar-select metric")
     parser.add_argument("--d-model", type=int, default=1024)
     parser.add_argument("--layers", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
@@ -209,6 +216,47 @@ def main() -> None:
     ema = Ema(model, args.ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
 
+    ar_model = ar_tokenizer = None
+    ar_paths: list[Path] = []
+    if args.ar_select:
+        from .loading import load_music3_ar, load_tokenizer
+
+        ar_tokenizer = load_tokenizer()
+        ar_model = load_music3_ar(quantize=True, device=args.device, with_depth=False)
+        ar_paths = val_paths[: args.ar_tracks]
+
+    @torch.no_grad()
+    def ar_loss_of_current(encoder: CodesEncoder) -> float:
+        """Teacher-forced AR loss of the encoder's predicted codes — the
+        downstream quality currency (call with EMA weights loaded)."""
+        from safetensors import safe_open
+
+        from .encoder import logprobs_to_codes, windowed_logprobs
+        from .prompt import encode_prompt
+
+        encoder.eval()
+        losses = []
+        for path in ar_paths:
+            with safe_open(path, framework="pt") as f:
+                latent = f.get_tensor("latent").float()
+                truth = f.get_tensor("codes")
+                meta = f.metadata() or {}
+            frames = truth.shape[0]
+            feats = latent_to_features(latent, frames).to(args.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.device.startswith("cuda")):
+                c0_lp, ac_lp = windowed_logprobs(encoder, feats, frames, args.crop)
+            predicted = logprobs_to_codes(c0_lp, ac_lp)
+            ids = torch.tensor(
+                [encode_prompt(ar_tokenizer, meta.get("caption", ""), meta.get("lyrics", ""))],
+                device=args.device,
+            )
+            loss = ar_model.global_loss(
+                ids, predicted.unsqueeze(0).to(args.device), supervise_audio_end=False
+            )
+            losses.append(loss.item())
+        encoder.train()
+        return sum(losses) / len(losses)
+
     def lr_lambda(step: int) -> float:
         if step < args.warmup:
             return (step + 1) / args.warmup
@@ -239,8 +287,9 @@ def main() -> None:
         )
     )
 
-    val_history: list[tuple[int, dict[str, float]]] = []
+    val_history: list[tuple[int, dict]] = []
     best_top1 = -1.0
+    best_ar = float("inf")
     step = 0
     columns = [
         TextColumn("[bold magenta]encoder"),
@@ -259,8 +308,12 @@ def main() -> None:
                     break
                 features = batch["features"].to(args.device, non_blocking=True)
                 codes = batch["codes"].to(args.device, non_blocking=True)
+                # exposure-bias fix: ramp scheduled sampling over the first half
+                scheduled_p = args.scheduled_max * min(1.0, step / max(1, args.steps * 0.5))
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.device.startswith("cuda")):
-                    c0_logits, acoustic_logits = model(features, c0_teacher=codes[..., 0])
+                    c0_logits, acoustic_logits = model(
+                        features, c0_teacher=codes[..., 0], scheduled_p=scheduled_p
+                    )
                     c0_loss = F.cross_entropy(
                         c0_logits.flatten(0, 1).float(),
                         codes[..., 0].flatten(),
@@ -296,21 +349,33 @@ def main() -> None:
                 if step % args.val_every == 0 or step == args.steps:
                     backup = ema.copy_to(model)
                     metrics = evaluate(model, val_loader, args.device)
-                    model.load_state_dict(backup)
-                    val_history.append((step, metrics))
-                    log({"step": step, "val": {k: round(v, 5) for k, v in metrics.items()}})
-                    marker = ""
-                    if metrics["c0_top1"] > best_top1:
-                        best_top1 = metrics["c0_top1"]
-                        backup = ema.copy_to(model)
+                    if args.ar_select:
+                        metrics["ar_loss"] = ar_loss_of_current(model)
+                    is_best = (
+                        metrics["ar_loss"] < best_ar
+                        if args.ar_select
+                        else metrics["c0_top1"] > best_top1
+                    )
+                    if is_best:
+                        best_ar = metrics.get("ar_loss", best_ar)
                         save_encoder(model, args.out)
-                        model.load_state_dict(backup)
-                        marker = " [bold green]← best, saved[/bold green]"
+                    model.load_state_dict(backup)
+                    best_top1 = max(best_top1, metrics["c0_top1"])
+                    val_history.append((step, metrics))
+                    log({"step": step, "val": metrics})
+                    books = "/".join(f"{b:.1%}" for b in metrics["books"])
+                    ar_part = (
+                        f"  ar [bold yellow]{metrics['ar_loss']:.2f}[/bold yellow]"
+                        if args.ar_select
+                        else ""
+                    )
+                    marker = " [bold green]← best, saved[/bold green]" if is_best else ""
                     console.print(
                         f"  [bold]step {step:>6}[/bold]  "
                         f"c0 top1 [bold cyan]{metrics['c0_top1']:>6.1%}[/bold cyan]  "
                         f"top5 [cyan]{metrics['c0_top5']:>6.1%}[/cyan]  "
-                        f"acoustic [cyan]{metrics['acoustic_top1']:>6.1%}[/cyan]{marker}"
+                        f"acoustic [cyan]{metrics['acoustic_top1']:>6.1%}[/cyan] "
+                        f"[dim]({books})[/dim]{ar_part}{marker}"
                     )
 
     table = Table(title="validation history (EMA weights, no c0 teacher)", border_style="dim")
@@ -326,13 +391,10 @@ def main() -> None:
             f"{metrics['acoustic_top1']:.1%}",
         )
     console.print(table)
-    console.print(
-        Panel.fit(
-            f"best val c0 top-1: [bold green]{best_top1:.1%}[/bold green]  "
-            f"(chance {1 / 16384:.3%})\nencoder saved to [cyan]{args.out}[/cyan]",
-            border_style="green",
-        )
-    )
+    summary = f"best val c0 top-1: [bold green]{best_top1:.1%}[/bold green]  (chance {1 / 16384:.3%})"
+    if args.ar_select:
+        summary += f"\nbest AR loss (selection metric): [bold green]{best_ar:.3f}[/bold green]  (model-own ≈ 2, random ≈ 9.7)"
+    console.print(Panel.fit(summary + f"\nencoder saved to [cyan]{args.out}[/cyan]", border_style="green"))
     log_file.close()
 
 

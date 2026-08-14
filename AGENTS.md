@@ -108,6 +108,21 @@ the inverse mapping. Proven feasible (see Results).
    cache after reading model shards — `drop_caches` or `.wslconfig`
    `autoMemoryReclaim=gradual`, not a process leak
 
+## Decode/selection extras (post-review upgrades, untested on GPU yet)
+
+- `music3-encode --refine N --refine-lambda 0.5`: AR-prior re-decoding —
+  fuses the encoder's frame-local log-probs with the frozen 8B's sequential
+  prior (and the depth decoder's per-book prior) via iterated conditional
+  modes. λ is a fidelity dial: verify envelope correlation when tuning.
+- windowed inference now **averages log-probs across half-overlapping
+  windows** (was: keep-center-only)
+- `music3-train-encoder --scheduled-max 0.5` (default on): scheduled
+  sampling for the acoustic c0 conditioning — fixes the teacher/inference
+  exposure bias; per-book acoustic accuracies are logged and printed
+- `music3-train-encoder --ar-select`: checkpoint selection by teacher-forced
+  AR loss of predicted codes (the downstream currency) instead of c0 top-1;
+  loads the 8B alongside (~5.5 GB extra)
+
 ## Open threads
 
 - Encoder ceiling is data-bound: next jump = bigger corpus (pod runs with
